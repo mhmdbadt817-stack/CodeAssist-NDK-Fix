@@ -84,10 +84,6 @@ class NdkToolchain(
             }
             unpacked = true
         }
-        // Asked once per process, not per call. Every completion and every error check calls this first, and
-        // launching `clang --version` each time was a second process per keystroke for an answer that cannot
-        // change while the IDE runs: an updated plugin is only picked up by a restart. A failure is not kept,
-        // so a toolchain that did not run is asked again next time.
         ready?.let { return it }
         val version = run(listOf(driver.toString(), "clang", "--version"))
         return if (version.ok) Status.Ready(version.output.lineSequence().firstOrNull().orEmpty()).also { ready = it }
@@ -99,11 +95,6 @@ class NdkToolchain(
 
     /**
      * Unpack `assets/toolchain.zip` into [root], once per version.
-     *
-     * Read through the classloader rather than an AssetManager, because a plugin has no `Context` for its own
-     * package. That works because the classloader's path IS the installed APK, so an asset is reachable as an
-     * ordinary zip entry. It also has to be ONE entry: a classloader can open a name but cannot list a
-     * directory, so ~2800 loose files would be unreachable for want of a way to enumerate them.
      */
     private fun unpackAssets() {
         val stamp = root.resolve(".version")
@@ -115,8 +106,6 @@ class NdkToolchain(
 
         val progress = messages?.startProgress("Unpacking the NDK toolchain")
         try {
-            // A partial unpack from an interrupted first run must not read as a complete one; the stamp is
-            // written last, and a previous attempt's tree is dropped rather than merged into.
             if (root.exists()) root.toFile().deleteRecursively()
             Files.createDirectories(root)
 
@@ -125,8 +114,6 @@ class NdkToolchain(
                 while (true) {
                     val entry = zip.nextEntry ?: break
                     val target = root.resolve(entry.name).normalize()
-                    // An archive we built ourselves, but unpacking is where a crafted path would escape, and
-                    // the check costs nothing.
                     require(target.startsWith(root)) { "entry escapes the toolchain directory: ${entry.name}" }
                     if (entry.isDirectory) {
                         Files.createDirectories(target)
@@ -148,23 +135,12 @@ class NdkToolchain(
 
     /**
      * The packaged `android_native_app_glue`, or null when the toolchain has not been unpacked.
-     *
-     * Source, not a library: the NDK ships the glue to be compiled into each app, so a NativeActivity build
-     * compiles `android_native_app_glue.c` alongside the module's own sources and puts this directory on the
-     * include path. There is nothing to link and nothing to find at runtime.
      */
     val nativeAppGlueDir: Path?
         get() = root.resolve("native_app_glue").takeIf { Files.isDirectory(it) }
 
     /**
      * What the unpacked tree was unpacked FROM, so an updated plugin re-unpacks.
-     *
-     * A hand-bumped constant is the wrong key and was wrong here: the archive gained the NativeActivity glue
-     * and every device that had already unpacked kept a tree without it, which surfaced as
-     * `'android_native_app_glue.h' file not found` on a project that was correct in every other respect. The
-     * driver is replaced by the package manager on every install, so its size and timestamp identify the
-     * package this tree came out of; the constant stays in front of it for a layout change the same APK
-     * could introduce.
      */
     private fun layoutStamp(): String {
         val d = driver ?: return LAYOUT_VERSION
@@ -176,32 +152,21 @@ class NdkToolchain(
 
     /**
      * The shared C++ runtime an app linked with `c++_shared` has to carry in its APK beside its own library.
-     * Null before [prepare] has unpacked the toolchain.
      */
     fun sharedCxxRuntime(abi: NdkAbi = hostAbi): Path? =
         root.resolve("sysroot/usr/lib/${abi.libTriple}/libc++_shared.so").takeIf { Files.isRegularFile(it) }
 
     /**
-     * The ABI this device runs, which is the ABI the compiler itself was unpacked for and the only one whose
-     * programs can be started here. Editor tooling (errors, completion) checks against it too, since what a
-     * file means rarely depends on the target and the device's own is always installed.
+     * The ABI this device runs.
      */
     val hostAbi: NdkAbi by lazy {
         NdkAbi.forDevice(runCatching { android.os.Build.SUPPORTED_ABIS.toList() }.getOrDefault(emptyList()))
     }
 
-    /**
-     * What a tool printed, and whether it succeeded. [bufferName] is the name diagnostics in [output] give the
-     * checked buffer: `<stdin>` from the command line, the file's own path from the resident daemon.
-     */
     data class ToolResult(val ok: Boolean, val output: String, val bufferName: String = "<stdin>")
 
     /**
-     * Compile [source] to [output]. [cpp] selects the C++ driver, which is `--driver-mode=g++` rather than a
-     * `clang++` of its own, because an APK carries no symlink to make one.
-     *
-     * With a [depFile], clang also writes every header the source opened into it (`-MD -MF`), as a by-product
-     * of the same compile, which is what lets the next build skip this source until one of them changes.
+     * Compile [source] to [output].
      */
     fun compile(
         source: Path,
@@ -227,16 +192,7 @@ class NdkToolchain(
     }
 
     /**
-     * Check the buffer [text] for errors without producing anything, as if it were the file at [source].
-     *
-     * This is the plugin's whole diagnostics story, and the reason it needs no language server: the compiler
-     * that will build the file is the one that reports on it, so what the editor underlines and what the
-     * build fails on cannot disagree.
-     *
-     * The buffer goes in through **stdin**, not a temporary file, so what is checked is what the user is
-     * looking at rather than the last thing they saved. That costs the file's identity, which two things
-     * restore: the process runs in the file's own directory, so `#include "sibling.h"` resolves the way it
-     * will in the build, and clang reports positions against `<stdin>`, which the caller maps back.
+     * Check the buffer [text] for errors without producing anything.
      */
     fun syntaxCheck(
         source: Path,
@@ -254,13 +210,9 @@ class NdkToolchain(
                 addAll(extraFlags)
                 addAll(preambleFlags(preamble))
                 add("-fsyntax-only")
-                // Positions only, in a form worth parsing: no caret art, no colour escapes, and explicit
-                // source ranges so a diagnostic underlines the construct rather than a single character.
                 add("-fno-caret-diagnostics")
                 add("-fno-color-diagnostics")
                 add("-fdiagnostics-print-source-range-info")
-                // Read the buffer from stdin, told explicitly which language it is: with no file name there
-                // is no extension for clang to infer from.
                 add("-x"); add(languageFor(source, cpp))
                 add("-")
             },
@@ -271,12 +223,7 @@ class NdkToolchain(
     }
 
     /**
-     * Ask clang what could be typed at [line]:[column] (both 1-based) in the buffer [text]. [offset] is the
-     * same position as a char offset, which decides whether the precompiled preamble can be used: not when
-     * the position is inside it, as it is while typing an `#include`.
-     *
-     * The same compiler, the same flags and the same include path as the build, so what the popup offers is
-     * what will actually compile.
+     * Ask clang what could be typed at [line]:[column].
      */
     fun complete(
         source: Path,
@@ -297,16 +244,12 @@ class NdkToolchain(
                 addAll(extraFlags)
                 addAll(preambleFlags(preamble))
                 add("-fsyntax-only")
-                // The position is named against `-`, the same name the buffer arrives under on stdin.
                 add("-Xclang"); add("-code-completion-at=-:$line:$column")
-                // Macros are most of what a C header offers, and leaving them out would make completion in C
-                // look broken. Brief comments give the popup a documentation line for free.
                 add("-Xclang"); add("-code-completion-macros")
                 add("-Xclang"); add("-code-completion-brief-comments")
                 add("-x"); add(languageFor(source, cpp))
                 add("-")
             },
-            // Shorter than a build: a popup that arrives after this long has already been given up on.
             timeoutSeconds = 20,
             stdin = text,
             workingDir = source.parent,
@@ -315,9 +258,7 @@ class NdkToolchain(
     }
 
     /**
-     * Classify the identifiers in [text] (see the daemon's `tokens` command and [ClangSemanticTokens]). Only
-     * the resident daemon can answer this -- it needs the parsed file it keeps -- so on a toolchain without
-     * one, or when it is unavailable, the answer is null and the editor keeps its lexical colours.
+     * Classify the identifiers in [text].
      */
     fun semanticTokens(source: Path, text: String, cpp: Boolean, extraFlags: List<String>): ToolResult? =
         viaDaemon("tokens", source, text, cpp, extraFlags, cancellation = null)
@@ -326,23 +267,12 @@ class NdkToolchain(
     // The resident daemon (see ClangDaemon)
     // -----------------------------------------------------------------------------------------------
 
-    /** Null on a toolchain built before the daemon existed: then everything runs clang per request. */
     private val daemon: ClangDaemon? by lazy {
         val executable = reg.nativeLibrary(ClangDaemon.LIB) ?: return@lazy null
         if (!Files.isRegularFile(executable)) return@lazy null
         ClangDaemon(executable, executable.parent, reg.dataDir.resolve("daemon"), log)
     }
 
-    /**
-     * Ask the resident daemon, or answer null for the caller to run clang itself.
-     *
-     * Null covers every way the daemon cannot help: there is none, it died, it timed out, or it could not
-     * parse the file at all. The one exception is a request cancelled while it waited its turn, which must
-     * not fall through to a launch of its own -- that is answered as cancelled here.
-     *
-     * The arguments are the command line's minus what libclang supplies itself (`-fsyntax-only`, the input
-     * name), with `-x` naming the language because there is no extension on a buffer to infer it from.
-     */
     private fun viaDaemon(
         command: String,
         source: Path,
@@ -358,9 +288,6 @@ class NdkToolchain(
         val args = buildList {
             addAll(commonFlags())
             addAll(extraFlags)
-            // libclang precompiles each file's preamble itself; this makes it instantiate the headers'
-            // templates into it once, as PreambleCache does for the command line. Measured on the emulator:
-            // a check went 46-56 -> 16-25 ms. Same caveat as there; C has no templates.
             if (cpp) add("-fpch-instantiate-templates")
             add("-x"); add(languageFor(source, cpp))
         }
@@ -385,14 +312,6 @@ class NdkToolchain(
         PreambleCache(reg.dataDir.resolve("preambles"), log, build = ::buildPreamble)
     }
 
-    /**
-     * Run [invoke] with the buffer's precompiled preamble when one is built, and without it otherwise.
-     *
-     * Without one, the request costs what it always did and a build is queued for next time. With one,
-     * clang loads the headers instead of parsing them; if it refuses the file because a header has changed
-     * since, the request is re-run without it and the preamble is rebuilt, so a stale cache can cost one
-     * extra launch but never a wrong answer.
-     */
     private fun withPreamble(
         source: Path,
         text: String,
@@ -425,7 +344,6 @@ class NdkToolchain(
             ?: return timed(invoke(driver, null), "(preamble queued)")
 
         val result = invoke(driver, ready)
-        // A cancelled run's output is cut short, so it says nothing about whether the preamble is stale.
         if (cancellation?.isCancelled == true) return timed(result, "(cancelled)")
         if (!PreambleCache.isStale(result.output)) return timed(result, "(preamble)")
         log.info("a precompiled preamble went stale: ${result.output.lineSequence().firstOrNull().orEmpty().take(200)}")
@@ -433,19 +351,10 @@ class NdkToolchain(
         return timed(invoke(driver, null), "(stale preamble, rebuilt)")
     }
 
-    /** The two flags that load a precompiled preamble and skip the bytes of the buffer it stands for. */
     private fun preambleFlags(preamble: PreambleCache.Ready?): List<String> =
         if (preamble == null) emptyList()
         else listOf("-include-pch", preamble.pch.toString(), "-Xclang", "-preamble-bytes=${preamble.bytes},1")
 
-    /**
-     * Compile a preamble, already written to [header], into [pch].
-     *
-     * As a HEADER of the source's language, with the source's flags and from the source's directory, so it
-     * means what those lines mean at the top of the file: relative `-I` flags resolve from the same place, and
-     * `-iquote` stands in for the directory a quote-include is looked up in first, which for this file would
-     * be the cache directory rather than the source's.
-     */
     private fun buildPreamble(request: PreambleCache.Request, header: Path, pch: Path): ToolResult {
         val driver = driver ?: return ToolResult(false, "no compiler for this device's ABI")
         return run(
@@ -454,13 +363,6 @@ class NdkToolchain(
                 if (request.cpp) add("--driver-mode=g++")
                 addAll(commonFlags())
                 addAll(request.flags)
-                // Instantiate the templates the headers use once, into the .pch, instead of at the end of
-                // every check that loads it. Measured on the emulator: an error check on a file including
-                // six standard headers went 59 -> 31 ms, on an empty file 52 -> 20 ms, at no cost to the
-                // build of the .pch itself. The price is rare: code that explicitly specializes a template
-                // AFTER a header already used it can see a false "explicit specialization after
-                // instantiation" in the editor. The build does not use the .pch, so it is never affected.
-                // C++ only; C has no templates and would warn that the flag is unused.
                 if (request.cpp) add("-fpch-instantiate-templates")
                 add("-iquote"); add(request.sourceDir.toString())
                 add("-x"); add(if (request.cpp) "c++-header" else "c-header")
@@ -475,11 +377,7 @@ class NdkToolchain(
     /**
      * Link [objects] into a shared library at [output].
      *
-     * [cpp] links through the C++ driver, which is what brings the C++ runtime in; [stl] says which one (see
-     * [NdkFacet.stl]). Linked through the C driver, C++ code links without error and then fails at
-     * `System.loadLibrary` with "cannot locate symbol", because nothing provided `std::` or `operator new`.
-     * `--no-undefined` is the guard against that whole class: an unresolved symbol is a link error here, with
-     * its name, instead of a crash on the device.
+     * [libraryDirs] contains extra directories in which the linker should search for libraries.
      */
     fun linkShared(
         objects: List<Path>,
@@ -488,15 +386,20 @@ class NdkToolchain(
         cpp: Boolean = false,
         stl: String = "c++_static",
         abi: NdkAbi = hostAbi,
-    ): ToolResult = link(objects, output, libs, cpp, stl, shared = true, abi)
+        libraryDirs: List<Path> = emptyList(),
+    ): ToolResult = link(
+        objects = objects,
+        output = output,
+        libs = libs,
+        cpp = cpp,
+        stl = stl,
+        shared = true,
+        abi = abi,
+        libraryDirs = libraryDirs,
+    )
 
     /**
      * Link [objects] into a program at [output], for Run.
-     *
-     * The same flags as [linkShared] minus `-shared`: Android executables are position-independent by
-     * default, which is also what lets one set of `-fPIC` objects serve both the library a build packages
-     * and the program Run starts. Aligned to 16 KB like every other output, because Android 15 refuses to
-     * map a 4 KB-aligned program at all ("program alignment (4096) cannot be smaller than system page size").
      */
     fun linkExecutable(
         objects: List<Path>,
@@ -505,7 +408,17 @@ class NdkToolchain(
         cpp: Boolean = false,
         stl: String = "c++_static",
         abi: NdkAbi = hostAbi,
-    ): ToolResult = link(objects, output, libs, cpp, stl, shared = false, abi)
+        libraryDirs: List<Path> = emptyList(),
+    ): ToolResult = link(
+        objects = objects,
+        output = output,
+        libs = libs,
+        cpp = cpp,
+        stl = stl,
+        shared = false,
+        abi = abi,
+        libraryDirs = libraryDirs,
+    )
 
     private fun link(
         objects: List<Path>,
@@ -515,6 +428,7 @@ class NdkToolchain(
         stl: String,
         shared: Boolean,
         abi: NdkAbi,
+        libraryDirs: List<Path>,
     ): ToolResult {
         val driver = driver ?: return ToolResult(false, "no compiler for this device's ABI")
         val linker = linker ?: return ToolResult(false, "no linker for this device's ABI")
@@ -529,16 +443,19 @@ class NdkToolchain(
                 if (cpp) when (stl) {
                     "c++_static" -> add("-static-libstdc++")
                     "none" -> add("-nostdlib++")
-                    // c++_shared is the driver's own default on Android: it links libc++_shared.so.
                 }
-                // 16 KB pages. Android 15 runs a library whose LOAD segments are 4 KB-aligned in a
-                // compatibility mode and says so in a dialog on first launch, and Play requires alignment
-                // outright for apps targeting API 35+. The NDK's own toolchain passes this by default and
-                // ours has no default to inherit, so a library built here would ship misaligned forever.
                 addAll(PAGE_SIZE_FLAGS)
-                // --ld-path, not -fuse-ld=lld: there is no `ld.lld` on any PATH here, only the file we ship.
                 add("--ld-path=$linker")
                 objects.forEach { add(it.toString()) }
+
+                // Extra library search directories, for example:
+                // app/src/injLibs/android.arm64-v8a
+                libraryDirs.forEach { directory ->
+                    if (Files.isDirectory(directory)) {
+                        add("-L${directory.toAbsolutePath()}")
+                    }
+                }
+
                 libs.forEach { add("-l$it") }
                 add("-o"); add(output.toString())
             }
@@ -546,8 +463,7 @@ class NdkToolchain(
     }
 
     /**
-     * The Run launcher (`libndkrun.so`, tools/ndk-toolchain/daemon/ndkrun.c), which runs a program in a
-     * pseudo-terminal. Null on a toolchain built before it existed; Run then uses plain pipes.
+     * The Run launcher.
      */
     val runLauncher: Path?
         get() = reg.nativeLibrary(RUN_LAUNCHER_LIB)?.takeIf { Files.isRegularFile(it) }
@@ -555,13 +471,6 @@ class NdkToolchain(
     /** The directory the toolchain's own libraries are in, for a child process's `LD_LIBRARY_PATH`. */
     val libraryDir: Path? get() = driver?.parent
 
-    /**
-     * What to tell clang the buffer is.
-     *
-     * A header has to be compiled AS a header (`c++-header`), not as a main file. Given `c++`, clang treats
-     * it as a translation unit and reports the diagnostics that only make sense for one — every header
-     * opened in the editor draws `#pragma once in main file`, which is both wrong and unfixable by the user.
-     */
     private fun languageFor(source: Path, cpp: Boolean): String {
         val header = HEADER_EXTENSIONS.any { source.fileName.toString().endsWith(it) }
         return when {
@@ -572,14 +481,6 @@ class NdkToolchain(
         }
     }
 
-    /**
-     * The flags every invocation needs.
-     *
-     * clang works out where its own headers live from the path of the running executable. That is wrong here:
-     * the executable sits in a flat directory of `lib*.so` files rather than in a `bin/` beside a `lib/`, so
-     * both locations are named explicitly instead. Leaving either out produces a compiler that cannot find
-     * `stddef.h`, which reads like a broken install rather than a missing flag.
-     */
     private fun commonFlags(abi: NdkAbi = hostAbi): List<String> = listOf(
         "--target=${abi.target}",
         "-resource-dir", root.resolve("lib-clang").resolve(LLVM_MAJOR).toString(),
@@ -599,19 +500,11 @@ class NdkToolchain(
                 .redirectErrorStream(true)
                 .apply {
                     workingDir?.let { if (Files.isDirectory(it)) directory(it.toFile()) }
-                    // The child is a child of the IDE's process, so it does not inherit the plugin package's
-                    // own library search path; without this it cannot find libLLVM.so beside it.
                     environment()["LD_LIBRARY_PATH"] = libDir.toString()
                 }
                 .start()
-            // Registered before anything blocks, so a request cancelled from here on stops the compiler.
             cancellation?.attach(process)
 
-            // The timeout is a watchdog that kills the process, NOT `waitFor(timeout, unit)`. On Android that
-            // overload is java.lang.Process's default, which polls by sleeping in steps of up to 100 ms, so a
-            // compiler that finished in 25 ms was reported ~100 ms later -- measured on the emulator, it was
-            // most of what a completion request cost once the preamble was precompiled. It also only started
-            // counting after stdout closed, so it never caught a process that hung with stdout open.
             val timedOut = AtomicBoolean(false)
             val watchdog = WATCHDOG.schedule({
                 timedOut.set(true)
@@ -619,18 +512,12 @@ class NdkToolchain(
             }, timeoutSeconds, TimeUnit.SECONDS)
 
             try {
-                // Write the buffer and CLOSE, before reading a byte back. The other order deadlocks as soon as
-                // the input is larger than the pipe buffer: the compiler blocks writing diagnostics that nobody
-                // is draining, while we block writing source that it is not reading.
                 if (stdin != null) {
                     runCatching { process.outputStream.use { it.write(stdin.toByteArray()) } }
                 } else {
                     runCatching { process.outputStream.close() }
                 }
 
-                // Killing the process (a cancel or the watchdog) closes its streams, which on Android makes
-                // this read throw InterruptedIOException rather than see EOF. That is the expected end of a
-                // run we stopped ourselves, not a failure to report.
                 val output = try {
                     process.inputStream.bufferedReader().readText()
                 } catch (e: IOException) {
@@ -650,44 +537,21 @@ class NdkToolchain(
     }
 
     companion object {
-        /** Kills a tool that outlives its timeout. One daemon thread for every toolchain; it only ever waits. */
         private val WATCHDOG: ScheduledExecutorService = Executors.newSingleThreadScheduledExecutor { r ->
             Thread(r, "ndk-tool-watchdog").apply { isDaemon = true }
         }
 
-        /** `libllvmtools.so`: clang, ar, nm, strip and the rest, selected by the first argument. */
         const val DRIVER_LIB = "llvmtools"
-
-        /** `libld-gnu-lld.so`: the same binary under a name that reaches lld and tells it to be GNU-flavored. */
         const val LINKER_LIB = "ld-gnu-lld"
-
-        /** `libndkrun.so`: runs a user's console program in a pseudo-terminal. */
         const val RUN_LAUNCHER_LIB = "ndkrun"
 
         const val ASSET_ARCHIVE = "assets/toolchain.zip"
         const val LLVM_MAJOR = "18"
 
-        /**
-         * The API level the sysroot's link stubs and CRT objects were taken at; the NDK's `<triple><api>`.
-         * It is also the level every ABI's triple carries, since the build script ships one level per ABI.
-         */
         const val API_LEVEL = 26
-
-        /** arm64's target, kept for callers that predate [NdkAbi]. New code asks the ABI for its [NdkAbi.target]. */
         const val TARGET_TRIPLE = "aarch64-linux-android$API_LEVEL"
-
-        /** Bump when the packaged asset layout changes, so an older unpacked tree is replaced rather than reused. */
         const val LAYOUT_VERSION = "1"
 
-        /**
-         * What every shared library this plugin links is aligned to.
-         *
-         * 16 KB, not the linker's 4 KB default: a device with 16 KB pages (Android 15 and up) cannot map a
-         * 4 KB-aligned segment directly, so it either refuses the library or runs the app in a compatibility
-         * mode it warns the user about. Both values are set because they answer different questions --
-         * max-page-size is the alignment of the segments in the file, common-page-size what the linker
-         * assumes it can share.
-         */
         val PAGE_SIZE_FLAGS = listOf("-Wl,-z,max-page-size=16384", "-Wl,-z,common-page-size=16384")
 
         private val HEADER_EXTENSIONS = listOf(".h", ".hpp", ".hh", ".hxx", ".inl")
