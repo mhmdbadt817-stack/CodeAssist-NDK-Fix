@@ -26,9 +26,7 @@ import kotlin.io.path.extension
 /**
  * Compiles a module's C and C++ into the APK, as part of the ordinary build.
  *
- * One task per module that carries an [NdkFacet], wired ahead of the Android packaging merge. There is no
- * second build system involved: the facet says what to build and this calls clang directly, which is what
- * makes a native build possible on a device that has room for a compiler but not for CMake and ninja too.
+ * One task per module that carries an [NdkFacet], wired ahead of the Android packaging merge.
  */
 class NdkBuildPlugin(
     private val toolchain: () -> NdkToolchain?,
@@ -42,9 +40,6 @@ class NdkBuildPlugin(
             config.project.modules.any { it.facets.get(NdkFacet.KEY) != null }
 
     override fun apply(config: BuildConfiguration) {
-        // Declare the C/C++ directories to the model, here, because this is the earliest place the plugin is
-        // handed real `Module`s and therefore the only place it can reach the WORKSPACE-scoped service that
-        // does it. A project made from the template arrives with the root already declared and skips this.
         runCatching { NdkSourceRoots.ensureFor(config.project.modules, log) }
             .onFailure { log.warn("could not declare the native source roots", it) }
 
@@ -55,9 +50,6 @@ class NdkBuildPlugin(
             val taskName = TaskName(":${module.name}:compileNative")
             val buildDir = config.env.buildDir(module)
 
-            // The library is build output, so it goes under the build directory and is declared to whatever
-            // packages it. A host older than SPI 3.1.0 has no such declaration and packages only the module's
-            // own jniLibs roots, so there, and only there, it is written into `src/main/jniLibs`.
             val generated = buildDir.resolve("intermediates").resolve("ndk").resolve("lib")
             val libDir = if (declareNativeLibraries(config, module, generated, taskName)) generated
             else Paths.get(module.dir.path).resolve("src/main/jniLibs")
@@ -66,12 +58,6 @@ class NdkBuildPlugin(
                 NdkCompileTask(taskName, module, facet, buildDir, libDir, toolchain, log)
             }
 
-            // Where to hang it. Configuring a task no build system registered is silently ignored, so naming
-            // all of these is how one plugin serves every pipeline without probing which is running.
-            //
-            // The Android merge is ordered after this task by the declaration above; naming it here as well
-            // keeps that true on a host that predates the declaration. The assemble aggregates are the
-            // backstop for a pipeline that packages no native code at all.
             config.tasks.named(TaskName(":${module.name}:mergeNativeLibs${variant.cap()}"))
                 .configure { dependsOn(taskName) }
             config.tasks.named(Lifecycle.assemble(module.name)).configure { dependsOn(taskName) }
@@ -79,10 +65,6 @@ class NdkBuildPlugin(
         }
     }
 
-    /**
-     * Declare [dir] as [module]'s native libraries. False on a host older than SPI 3.1.0, where the call does
-     * not link: the plugin is built against the newer SPI and still has to work on the IDE the user has.
-     */
     private fun declareNativeLibraries(config: BuildConfiguration, module: Module, dir: Path, task: TaskName): Boolean =
         try {
             config.addNativeLibraries(module, dir, task)
@@ -96,15 +78,7 @@ class NdkBuildPlugin(
 }
 
 /**
- * Compiles every source the facet names and links them into one shared library at
- * `<libDir>/<abi>/lib<name>.so` -- or, with [executableDir], into a program at `<executableDir>/<abi>/<module>`
- * for Run. The two share their objects: everything is compiled `-fPIC`, which a position-independent
- * executable links as readily as a library does, so running a module after building it compiles nothing.
- *
- * Incremental per source: each object keeps the dependency file clang wrote beside it, and a source is only
- * compiled again when it, or a header it included, is newer than its object, or when the flags changed.
- * Objects are named after the source's path inside the module, so two `util.cpp` in different directories
- * are two objects rather than one overwriting the other.
+ * Compiles every source the facet names and links them into one shared library.
  */
 internal class NdkCompileTask(
     override val name: TaskName,
@@ -114,13 +88,46 @@ internal class NdkCompileTask(
     private val libDir: Path,
     private val toolchain: () -> NdkToolchain?,
     private val log: Logger,
-    /** Link a program into this directory instead of the shared library; see [NdkRunTaskProvider]. */
     private val executableDir: Path? = null,
 ) : Task {
 
     private val moduleDir: Path get() = Paths.get(module.dir.path)
 
     private val executable: Boolean get() = executableDir != null
+
+    /**
+     * Local libraries directory for the requested ABI.
+     *
+     * Example:
+     * app/src/injLibs/android.arm64-v8a
+     */
+    private fun localLibraryDir(abi: String): Path =
+        moduleDir.resolve("src/injLibs/android.$abi")
+
+    /**
+     * Describes the files in a local library directory.
+     *
+     * This makes adding, removing, or updating a library invalidate the build inputs.
+     */
+    private fun libraryDirectoryStamp(abi: String): String {
+        val dir = localLibraryDir(abi)
+
+        if (!Files.isDirectory(dir)) {
+            return "$dir (missing)"
+        }
+
+        val files = Files.list(dir).use { stream ->
+            stream
+                .filter { Files.isRegularFile(it) }
+                .map { file ->
+                    "${file.fileName}:${Files.size(file)}:${Files.getLastModifiedTime(file).toMillis()}"
+                }
+                .sorted()
+                .collect(Collectors.joining("\n"))
+        }
+
+        return "$dir\n$files"
+    }
 
     /** Every C and C++ file under the facet's source directories. */
     private fun sources(): List<Path> = facet.sourceDirs
@@ -140,35 +147,39 @@ internal class NdkCompileTask(
         .filter { Files.isDirectory(it) }
         .flatMap { dir ->
             Files.walk(dir).use { walk ->
-                walk.filter { Files.isRegularFile(it) && it.extension.lowercase() in HEADER_EXTENSIONS }.collect(Collectors.toList())
+                walk.filter { Files.isRegularFile(it) && it.extension.lowercase() in HEADER_EXTENSIONS }
+                    .collect(Collectors.toList())
             }
         }
         .sorted()
 
     internal fun outputFor(abi: String): Path =
-        executableDir?.resolve(abi)?.resolve(module.name) ?: libDir.resolve(abi).resolve("lib${facet.libraryName}.so")
+        executableDir?.resolve(abi)?.resolve(module.name)
+            ?: libDir.resolve(abi).resolve("lib${facet.libraryName}.so")
 
     private val objRoot: Path get() = buildDir.resolve("intermediates").resolve("ndk").resolve("obj")
 
     override val inputs: TaskInputs
         get() = TaskInputsImpl().apply {
             sources().forEach { property("src:$it", NativeIncremental.modified(it)) }
-            // A header is an input as much as a source is: editing only `values.h` has to rebuild every file
-            // that includes it, and without this the task is up to date and the APK keeps the old library.
+
             headers().forEach { property("h:$it", NativeIncremental.modified(it)) }
-            // Headers outside the source directories (an `-I` in the flags, the glue, the toolchain's own)
-            // are known from the last build's dependency files.
+
             property(
                 "deps",
                 NativeIncremental.recordedDependencies(objRoot)
                     .joinToString("\n") { "$it@${NativeIncremental.modified(Paths.get(it))}" }
                     .hashCode(),
             )
-            // The configuration is an input too: changing the C++ standard or the optimization level has to
-            // rebuild even though not a byte of source moved.
+
             property("facet", NdkFacetCodec.encode(facet).toString())
             property("libDir", libDir.toString())
             property("executableDir", executableDir?.toString())
+
+            // Local native libraries are build inputs too.
+            facet.abis.distinct().forEach { abi ->
+                property("injLibs:$abi", libraryDirectoryStamp(abi))
+            }
         }
 
     override val outputs: TaskOutputs
@@ -178,10 +189,13 @@ internal class NdkCompileTask(
 
     override suspend fun execute(ctx: TaskContext): TaskResult {
         ctx.checkCanceled()
-        val toolchain = toolchain() ?: return skip(ctx, "the NDK plugin has no toolchain on this device")
+
+        val toolchain = toolchain()
+            ?: return skip(ctx, "the NDK plugin has no toolchain on this device")
+
         val sources = sources()
+
         if (sources.isEmpty()) {
-            // Not a failure: a module can carry the facet before anyone has written any C++ into it.
             ctx.logger()("ndk: no C or C++ sources under ${facet.sourceDirs.joinToString()} — nothing to build")
             return TaskResult.Success
         }
@@ -191,10 +205,10 @@ internal class NdkCompileTask(
             is NdkToolchain.Status.Ready -> status.version.also { ctx.logger()("ndk: $it") }
         }
 
-        // A library is built for every ABI the module asks for. A program (Run) is built for exactly one: the
-        // device's own, because it is started here and nothing else can run. An ABI the toolchain does not know
-        // is reported rather than dropped, so the user is not left wondering why the APK lacks a lib directory.
-        val buildable: List<NdkAbi> = if (executable) listOf(toolchain.hostAbi) else facet.abis.mapNotNull { NdkAbi.byName(it) }.distinct()
+        val buildable: List<NdkAbi> =
+            if (executable) listOf(toolchain.hostAbi)
+            else facet.abis.mapNotNull { NdkAbi.byName(it) }.distinct()
+
         if (!executable) {
             facet.abis.filter { NdkAbi.byName(it) == null }.forEach {
                 ctx.diagnostics.report(
@@ -207,39 +221,59 @@ internal class NdkCompileTask(
                 )
             }
         }
-        if (buildable.isEmpty()) return skip(ctx, "no ABI this toolchain can target")
+
+        if (buildable.isEmpty()) {
+            return skip(ctx, "no ABI this toolchain can target")
+        }
 
         for (abi in buildable) {
             ctx.checkCanceled()
+
             val result = buildAbi(ctx, toolchain, version, sources, abi)
+
             if (result != null) return result
+
             if (!executable) removeLegacyOutput(ctx, abi.abiName)
         }
+
         return TaskResult.Success
     }
 
     /**
-     * Delete the library an older version of this plugin wrote into `src/main/jniLibs/<abi>/`.
-     *
-     * Leaving it would not be harmless: the Android merge reads the module's jniLibs before declared build
-     * output and keeps the first library of a name, so the stale copy would be packaged and every later
-     * change to the C++ would build and never reach the APK.
+     * Delete the library an older version of this plugin wrote into src/main/jniLibs.
      */
     private fun removeLegacyOutput(ctx: TaskContext, abi: String) {
         val legacyDir = moduleDir.resolve("src/main/jniLibs")
+
         if (libDir.normalize() == legacyDir.normalize()) return
+
         val abiDir = legacyDir.resolve(abi)
         val stale = abiDir.resolve("lib${facet.libraryName}.so")
+
         if (!Files.isRegularFile(stale)) return
+
         runCatching {
             Files.delete(stale)
-            ctx.logger()("ndk: removed src/main/jniLibs/$abi/${stale.fileName}, which an earlier version of the NDK plugin wrote; native output now goes to ${moduleDir.relativize(libDir)}")
-            Files.newDirectoryStream(abiDir).use { if (!it.iterator().hasNext()) Files.delete(abiDir) }
-            Files.newDirectoryStream(legacyDir).use { if (!it.iterator().hasNext()) Files.delete(legacyDir) }
-        }.onFailure { log.warn("could not remove the stale $stale", it) }
+
+            ctx.logger()(
+                "ndk: removed src/main/jniLibs/$abi/${stale.fileName}, " +
+                    "which an earlier version of the NDK plugin wrote; " +
+                    "native output now goes to ${moduleDir.relativize(libDir)}"
+            )
+
+            Files.newDirectoryStream(abiDir).use {
+                if (!it.iterator().hasNext()) Files.delete(abiDir)
+            }
+
+            Files.newDirectoryStream(legacyDir).use {
+                if (!it.iterator().hasNext()) Files.delete(legacyDir)
+            }
+        }.onFailure {
+            log.warn("could not remove the stale $stale", it)
+        }
     }
 
-    /** Compile what changed and link one ABI; null on success, a failure result otherwise. */
+    /** Compile what changed and link one ABI. */
     private fun buildAbi(
         ctx: TaskContext,
         toolchain: NdkToolchain,
@@ -247,165 +281,311 @@ internal class NdkCompileTask(
         sources: List<Path>,
         target: NdkAbi,
     ): TaskResult? {
+
         val abi = target.abiName
         val objDir = objRoot.resolve(abi)
 
-        // The glue is compiled into the app rather than linked: the NDK ships it as source for exactly that.
-        val glue = if (facet.nativeActivity) toolchain.nativeAppGlueDir?.resolve("android_native_app_glue.c") else null
-        val units = sources.map { it to objectKey(it) } +
-            listOfNotNull(glue?.takeIf { Files.isRegularFile(it) }?.let { it to "_glue/${it.fileName}" })
+        // Local libraries for this ABI.
+        val extraLibraryDir = localLibraryDir(abi)
 
-        // Flags change what every object contains, so a different set of them invalidates all of them. The
-        // compiler's version is part of it: an updated plugin brings an updated clang.
+        val libraryDirs = if (Files.isDirectory(extraLibraryDir)) {
+            listOf(extraLibraryDir)
+        } else {
+            emptyList()
+        }
+
+        val glue = if (facet.nativeActivity) {
+            toolchain.nativeAppGlueDir?.resolve("android_native_app_glue.c")
+        } else {
+            null
+        }
+
+        val units = sources.map { it to objectKey(it) } +
+            listOfNotNull(
+                glue?.takeIf { Files.isRegularFile(it) }
+                    ?.let { it to "_glue/${it.fileName}" }
+            )
+
         val compileStamp = buildString {
             appendLine(version)
             appendLine(NdkFlags.build(facet, toolchain, cpp = true).joinToString(" "))
             appendLine(NdkFlags.build(facet, toolchain, cpp = false).joinToString(" "))
         }
+
         val compileStampFile = objDir.resolve("compile.stamp")
-        if (readStamp(compileStampFile) != compileStamp) deleteTree(objDir)
+
+        if (readStamp(compileStampFile) != compileStamp) {
+            deleteTree(objDir)
+        }
+
         Files.createDirectories(objDir)
 
         val objects = ArrayList<Path>()
+
         val stale = units.filter { (source, key) ->
             val obj = objDir.resolve("$key.o")
             NativeIncremental.isStale(source, obj, depFileFor(obj))
         }
+
         if (stale.isNotEmpty()) {
             ctx.logger()("ndk: compiling ${stale.size} of ${units.size} source(s) for $abi")
         }
+
         for ((index, unit) in stale.withIndex()) {
             val (source, key) = unit
+
             ctx.checkCanceled()
-            // A real fraction rather than indeterminate: a native build is the slow part of an Android build
-            // on a phone, and a bar that moves is the difference between waiting and wondering.
-            ctx.progress.report(index.toDouble() / (stale.size + 1), "Compiling ${source.fileName}")
+
+            ctx.progress.report(
+                index.toDouble() / (stale.size + 1),
+                "Compiling ${source.fileName}"
+            )
+
             val obj = objDir.resolve("$key.o")
             val isCpp = source.extension.lowercase() != "c"
+
             val compiled = toolchain.compile(
-                source, obj, cpp = isCpp,
+                source,
+                obj,
+                cpp = isCpp,
                 extraFlags = NdkFlags.build(facet, toolchain, isCpp),
                 depFile = depFileFor(obj),
                 abi = target,
             )
+
             report(ctx, compiled.output, source)
+
             if (!compiled.ok) {
-                // A failed compile can leave a partial object behind; without its dependency file the next
-                // build treats it as stale either way, but there is no reason to keep it.
-                runCatching { Files.deleteIfExists(obj); Files.deleteIfExists(depFileFor(obj)) }
+                runCatching {
+                    Files.deleteIfExists(obj)
+                    Files.deleteIfExists(depFileFor(obj))
+                }
+
                 ctx.logger()("ndk: failed to compile ${source.fileName}")
+
                 return TaskResult.Failed("ndk: ${source.fileName} did not compile")
             }
         }
+
         writeStamp(compileStampFile, compileStamp)
-        units.forEach { (_, key) -> objects.add(objDir.resolve("$key.o")) }
+
+        units.forEach { (_, key) ->
+            objects.add(objDir.resolve("$key.o"))
+        }
+
         removeOrphanObjects(objDir, objects.toSet())
 
         val out = outputFor(abi)
-        // Linking through the C++ driver is what brings the runtime in, so it follows the sources, not a flag.
-        val cpp = units.any { (source, _) -> source.extension.lowercase() != "c" }
+
+        val cpp = units.any { (source, _) ->
+            source.extension.lowercase() != "c"
+        }
+
         val linkStamp = buildString {
             appendLine(version)
             objects.forEach { appendLine(it.toString()) }
             appendLine(facet.linkLibraries.joinToString(" "))
             appendLine("cpp=$cpp stl=${facet.stl}")
+
+            // Include local library paths and their file information.
+            appendLine("libraryDirs:")
+            libraryDirs.forEach { appendLine(it.toAbsolutePath().toString()) }
+
+            appendLine(libraryDirectoryStamp(abi))
         }
-        // Separate stamps: linking the program must not make the library look up to date, or the reverse.
-        val linkStampFile = objDir.resolve(if (executable) "link-exe.stamp" else "link.stamp")
-        if (!NativeIncremental.needsLink(stale.isNotEmpty(), out, objects, linkStamp, readStamp(linkStampFile))) {
+
+        val linkStampFile = objDir.resolve(
+            if (executable) "link-exe.stamp" else "link.stamp"
+        )
+
+        if (!NativeIncremental.needsLink(
+                stale.isNotEmpty(),
+                out,
+                objects,
+                linkStamp,
+                readStamp(linkStampFile)
+            )
+        ) {
             ctx.logger()("ndk: ${out.fileName} for $abi is up to date")
             return null
         }
 
-        ctx.progress.report(stale.size.toDouble() / (stale.size + 1), "Linking ${out.fileName}")
-        val linked = if (executable) toolchain.linkExecutable(objects, out, facet.linkLibraries, cpp = cpp, stl = facet.stl, abi = target)
-        else toolchain.linkShared(objects, out, facet.linkLibraries, cpp = cpp, stl = facet.stl, abi = target)
+        ctx.progress.report(
+            stale.size.toDouble() / (stale.size + 1),
+            "Linking ${out.fileName}"
+        )
+
+        // Pass local library directories to the linker.
+        val linked = if (executable) {
+            toolchain.linkExecutable(
+                objects,
+                out,
+                facet.linkLibraries,
+                cpp = cpp,
+                stl = facet.stl,
+                abi = target,
+                libraryDirs = libraryDirs,
+            )
+        } else {
+            toolchain.linkShared(
+                objects,
+                out,
+                facet.linkLibraries,
+                cpp = cpp,
+                stl = facet.stl,
+                abi = target,
+                libraryDirs = libraryDirs,
+            )
+        }
+
         report(ctx, linked.output, null)
+
         if (!linked.ok) {
-            runCatching { Files.deleteIfExists(linkStampFile) }
+            runCatching {
+                Files.deleteIfExists(linkStampFile)
+            }
+
             return TaskResult.Failed("ndk: ${out.fileName} did not link")
         }
-        packageCxxRuntime(ctx, toolchain, cpp, out, target)?.let { return it }
+
+        packageCxxRuntime(ctx, toolchain, cpp, out, target)?.let {
+            return it
+        }
+
         writeStamp(linkStampFile, linkStamp)
 
-        ctx.logger()("ndk: wrote ${out.fileName} (${runCatching { Files.size(out) }.getOrDefault(0L)} bytes) for $abi")
+        ctx.logger()(
+            "ndk: wrote ${out.fileName} " +
+                "(${runCatching { Files.size(out) }.getOrDefault(0L)} bytes) for $abi"
+        )
+
         return null
     }
 
     /**
-     * Put `libc++_shared.so` beside the library when it links against it, since the APK must carry it and
-     * nothing else packages it. With any other runtime, a copy this task left there earlier is removed, but
-     * only from the build directory: in `src/main/jniLibs` the file may be the user's own.
+     * Put libc++_shared.so beside the library when needed.
      */
-    private fun packageCxxRuntime(ctx: TaskContext, toolchain: NdkToolchain, cpp: Boolean, out: Path, abi: NdkAbi): TaskResult? {
+    private fun packageCxxRuntime(
+        ctx: TaskContext,
+        toolchain: NdkToolchain,
+        cpp: Boolean,
+        out: Path,
+        abi: NdkAbi,
+    ): TaskResult? {
+
         val target = out.resolveSibling(CXX_SHARED)
+
         if (cpp && facet.stl == "c++_shared") {
             val runtime = toolchain.sharedCxxRuntime(abi)
-                ?: return TaskResult.Failed("ndk: stl = c++_shared, but the toolchain has no $CXX_SHARED for ${abi.abiName}")
-            runCatching { Files.copy(runtime, target, java.nio.file.StandardCopyOption.REPLACE_EXISTING) }
-                .onFailure { return TaskResult.Failed("ndk: could not package $CXX_SHARED: ${it.message}", it) }
+                ?: return TaskResult.Failed(
+                    "ndk: stl = c++_shared, but the toolchain has no $CXX_SHARED for ${abi.abiName}"
+                )
+
+            runCatching {
+                Files.copy(
+                    runtime,
+                    target,
+                    java.nio.file.StandardCopyOption.REPLACE_EXISTING
+                )
+            }.onFailure {
+                return TaskResult.Failed(
+                    "ndk: could not package $CXX_SHARED: ${it.message}",
+                    it
+                )
+            }
+
             ctx.logger()("ndk: packaged $CXX_SHARED")
+
         } else if (libDir.normalize() != moduleDir.resolve("src/main/jniLibs").normalize()) {
-            runCatching { Files.deleteIfExists(target) }
+            runCatching {
+                Files.deleteIfExists(target)
+            }
         }
+
         return null
     }
 
-    private fun depFileFor(obj: Path): Path = obj.resolveSibling(obj.fileName.toString() + ".d")
+    private fun depFileFor(obj: Path): Path =
+        obj.resolveSibling(obj.fileName.toString() + ".d")
 
-    /**
-     * Where under the object directory [source]'s object goes: its path inside the module. A source directory
-     * outside the module (`../shared`) would climb out of the build directory, so `..` becomes `__`.
-     */
     private fun objectKey(source: Path): String =
-        moduleDir.relativize(source).toString().replace('\\', '/').split('/')
-            .joinToString("/") { if (it == "..") "__" else it }
+        moduleDir.relativize(source).toString()
+            .replace('\\', '/')
+            .split('/')
+            .joinToString("/") {
+                if (it == "..") "__" else it
+            }
 
-    /** Drop the objects of sources that were deleted or renamed, so they stop being linked in. */
     private fun removeOrphanObjects(objDir: Path, keep: Set<Path>) {
         Files.walk(objDir).use { walk ->
-            walk.filter { Files.isRegularFile(it) && it.fileName.toString().endsWith(".o") && it !in keep }
-                .collect(Collectors.toList())
+            walk.filter {
+                Files.isRegularFile(it) &&
+                    it.fileName.toString().endsWith(".o") &&
+                    it !in keep
+            }.collect(Collectors.toList())
         }.forEach { obj ->
-            runCatching { Files.deleteIfExists(obj); Files.deleteIfExists(depFileFor(obj)) }
+            runCatching {
+                Files.deleteIfExists(obj)
+                Files.deleteIfExists(depFileFor(obj))
+            }
         }
     }
 
-    private fun readStamp(file: Path): String? = runCatching { String(Files.readAllBytes(file)) }.getOrNull()
+    private fun readStamp(file: Path): String? =
+        runCatching {
+            String(Files.readAllBytes(file))
+        }.getOrNull()
 
     private fun writeStamp(file: Path, text: String) {
-        runCatching { Files.write(file, text.toByteArray()) }.onFailure { log.warn("could not write $file", it) }
+        runCatching {
+            Files.write(file, text.toByteArray())
+        }.onFailure {
+            log.warn("could not write $file", it)
+        }
     }
 
     private fun deleteTree(dir: Path) {
         if (!Files.exists(dir)) return
-        Files.walk(dir).use { walk -> walk.sorted(Comparator.reverseOrder()).collect(Collectors.toList()) }
-            .forEach { runCatching { Files.deleteIfExists(it) } }
+
+        Files.walk(dir).use { walk ->
+            walk.sorted(Comparator.reverseOrder())
+                .collect(Collectors.toList())
+        }.forEach {
+            runCatching {
+                Files.deleteIfExists(it)
+            }
+        }
     }
 
-    /**
-     * Surface the compiler's own output as structured diagnostics.
-     *
-     * The same parser the editor uses, so a build error and the squiggle on the same line say the same thing
-     * in the same words. Positions are relative to the file clang was given, which here is a real path
-     * rather than the editor's `<stdin>`.
-     */
     private fun report(ctx: TaskContext, output: String, source: Path?) {
         if (output.isBlank()) return
-        val text = source?.let { runCatching { it.toFile().readText() }.getOrNull() }
-        val parsed = text?.let {
-            runCatching { ClangDiagnostics.parse(output, it, bufferName = source.toString()) }.getOrNull()
+
+        val text = source?.let {
+            runCatching { it.toFile().readText() }.getOrNull()
         }
+
+        val parsed = text?.let {
+            runCatching {
+                ClangDiagnostics.parse(output, it, bufferName = source.toString())
+            }.getOrNull()
+        }
+
         if (parsed.isNullOrEmpty()) {
-            // Nothing parseable: the linker's output, or a failure about the toolchain rather than the code.
-            output.lineSequence().filter { it.isNotBlank() }.forEach { ctx.logger()("ndk: $it") }
+            output.lineSequence()
+                .filter { it.isNotBlank() }
+                .forEach { ctx.logger()("ndk: $it") }
+
             return
         }
+
         for (d in parsed) {
             ctx.diagnostics.report(
                 BuildDiagnostic(
-                    severity = if (d.severity == dev.ide.lang.dom.Severity.ERROR) BuildSeverity.ERROR
-                    else BuildSeverity.WARNING,
+                    severity = if (d.severity == dev.ide.lang.dom.Severity.ERROR) {
+                        BuildSeverity.ERROR
+                    } else {
+                        BuildSeverity.WARNING
+                    },
                     message = d.message,
                     source = "ndk",
                     location = DiagnosticLocation(source?.toString() ?: module.dir.path),
@@ -414,9 +594,9 @@ internal class NdkCompileTask(
         }
     }
 
-    /** A device that cannot compile is not a broken build; it is a build with no native part. */
     private fun skip(ctx: TaskContext, why: String): TaskResult {
         log.warn("ndk: skipping the native build — $why")
+
         ctx.diagnostics.report(
             BuildDiagnostic(
                 severity = BuildSeverity.WARNING,
@@ -425,6 +605,7 @@ internal class NdkCompileTask(
                 location = DiagnosticLocation(module.dir.path),
             )
         )
+
         return TaskResult.Success
     }
 
